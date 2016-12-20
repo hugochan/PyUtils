@@ -4,17 +4,19 @@ Created on Dec, 2016
 @author: hugo
 
 '''
-
+from __future__ import absolute_import
 import os
-import json
+import re
+import string
 import numpy as np
 from collections import defaultdict
-from nltk.tokenize import RegexpTokenizer
+from nltk.tokenize import wordpunct_tokenize
+from nltk.stem.porter import PorterStemmer as EnglishStemmer
+# from nltk.tokenize import RegexpTokenizer
+
+from io_utils import dump_json, load_json
 
 
-####################
-# English stopwords
-###################
 def load_stopwords(file):
     stop_words = []
     try:
@@ -26,96 +28,47 @@ def load_stopwords(file):
 
     return stop_words
 
-
-###############
-# Save and load
-###############
-def save_json(data, file):
-    try:
-        with open(file, 'w') as datafile:
-            json.dump(data, datafile)
-    except Exception as e:
-        raise e
-
-def load_json(file):
-    try:
-        with open(file, 'r') as datafile:
-            data = json.load(datafile)
-    except Exception as e:
-        raise e
-
-    return data
-
-def load_pickle(path_to_file):
-    try:
-        with open(path_to_file, 'r') as f:
-            data = pickle.load(f)
-    except Exception as e:
-        raise e
-
-    return data
-
-def dump_pickle(data, path_to_file):
-    try:
-        with open(path_to_file, 'w') as f:
-            pickle.dump(data, f)
-    except Exception as e:
-        raise e
-
-########################
-# Construct corpus data
-########################
 def get_all_files(corpus_path, recursive=False):
-    '''Get all files in the directory
-        Mode: recursive or not.
-    '''
     if recursive:
         return [os.path.join(root, file) for root, dirnames, filenames in os.walk(corpus_path) for file in filenames if not file.startswith('.')]
     else:
         return [os.path.join(corpus_path, filename) for filename in os.listdir(corpus_path) if os.path.isfile(os.path.join(corpus_path, filename)) and not filename.startswith('.')]
 
-def save_corpus(out_corpus, doc_word_freq, vocab_dict, word_freq):
-    docs = {}
-    for filename, val in doc_word_freq.iteritems():
-        word_count = {}
-        for word, freq in val.iteritems():
-            try:
-                word_count[vocab_dict[word]] = freq
-            except: # word is not in vocab, i.e., this word should be filtered out
-                pass
-        docs[filename] = word_count
-    corpus = {'docs': docs, 'vocab': vocab_dict, 'word_freq': word_freq}
-    save_json(corpus, out_corpus)
-
-
 def load_data(corpus_path, recursive=False):
-    word_tokenizer = RegexpTokenizer(r'[a-zA-Z]+') # match only alphabet characters
-    try:
-        cached_stop_words = load_stopwords('patterns/stopwords.txt')
-        print 'loaded patterns/stopwords.txt'
-    except:
-        from nltk.corpus import stopwords
-        cached_stop_words = stopwords.words("english")
-        print 'loaded nltk.corpus.stopwords'
-
     word_freq = defaultdict(lambda: 0) # count the number of times a word appears in a corpus
     doc_word_freq = defaultdict(dict) # count the number of times a word appears in a doc
     files = get_all_files(corpus_path, recursive)
+
+    # word_tokenizer = RegexpTokenizer(r'[a-zA-Z]+') # match only alphabet characters
+    stemmer = EnglishStemmer()  # This method only works for english text
+    try:
+        stopword_path = 'patterns/english_stopwords.txt'
+        cached_stop_words = load_stopwords(os.path.join(os.path.split(__file__)[0], stopword_path))
+        print 'Loaded %s' % stopword_path
+    except:
+        from nltk.corpus import stopwords
+        cached_stop_words = stopwords.words("english")
+        print 'Loaded nltk.corpus.stopwords'
 
     for filename in files:
         try:
             with open(filename, 'r') as fp:
                 text = fp.read().lower()
-                words = word_tokenizer.tokenize(text)
-                words = [word for word in words if word not in cached_stop_words]
+                # words = [word for word in word_tokenizer.tokenize(text) if word not in cached_stop_words]
+                # remove punctuations, stopwords and *unnecessary digits*, stemming
+                words = [stemmer.stem(token) for token in wordpunct_tokenize(
+                        re.sub('[%s]' % re.escape(string.punctuation), ' ', text.decode(encoding='UTF-8', errors='ignore'))) if
+                        not token.isdigit() and not token in cached_stop_words]
 
                 for i in range(len(words)):
                     # doc-word frequency
-                    basename = os.path.basename(filename)
+                    # doc_name = os.path.basename(filename)
+                    parent_name, child_name = os.path.split(filename)
+                    doc_name = os.path.split(parent_name)[-1] + '_' + child_name
                     try:
-                        doc_word_freq[basename][words[i]] += 1
+                        doc_word_freq[doc_name][words[i]] += 1
                     except:
-                        doc_word_freq[basename][words[i]] = 1
+                        doc_word_freq[doc_name][words[i]] = 1
                     # word frequency
                     word_freq[words[i]] += 1
         except Exception as e:
@@ -123,22 +76,67 @@ def load_data(corpus_path, recursive=False):
 
     return word_freq, doc_word_freq
 
-def construct_corpus(corpus_path, out_corpus, threshold=5, recursive=False):
+def construct_corpus(corpus_path, training_phase, vocab_dict=None, threshold=5, topn=None, recursive=False):
+    if not (training_phase or isinstance(vocab_dict, dict)):
+        raise ValueError('vocab_dict must be provided if training_phase is set False')
+
     word_freq, doc_word_freq = load_data(corpus_path, recursive)
-    print 'finished loading'
-    vocab_dict = get_vocab_dict(word_freq, threshold=threshold, topn=None)
-    new_word_freq = dict([(word, freq) for word, freq in word_freq.items() if word in vocab_dict])
-    save_corpus(out_corpus, doc_word_freq, vocab_dict, new_word_freq)
+    if training_phase:
+        vocab_dict = build_vocab(word_freq, threshold=threshold, topn=topn)
+
+    docs = generate_bow(doc_word_freq, vocab_dict)
+    new_word_freq = dict([(vocab_dict[word], freq) for word, freq in word_freq.iteritems() if word in vocab_dict])
+
+    return docs, vocab_dict, new_word_freq
 
 def load_corpus(corpus_path):
     corpus = load_json(corpus_path)
 
     return corpus
 
+def generate_bow(doc_word_freq, vocab_dict):
+    docs = {}
+    for key, val in doc_word_freq.iteritems():
+        word_count = {}
+        for word, freq in val.iteritems():
+            try:
+                word_count[vocab_dict[word]] = freq
+            except: # word is not in vocab, i.e., this word should be discarded
+                continue
+        docs[key] = word_count
 
-####################################
-# Doc representation (bag of words)
-####################################
+    return docs
+
+def build_vocab(word_freq, threshold=5, topn=None):
+    """
+    threshold only take effects when topn is None.
+    """
+    if topn:
+        word_freq = dict(sorted(word_freq.iteritems(), key=lambda d:d[1], reverse=True)[:topn])
+        vocab_dict = dict(zip(word_freq.keys(), range(len(word_freq))))
+    else:
+        idx = 0
+        vocab_dict = {}
+        for word, freq in word_freq.iteritems():
+            if freq < threshold:
+                continue
+            vocab_dict[word] = idx
+            idx += 1
+    return vocab_dict
+
+def construct_train_test_corpus(train_path, test_path, output, threshold=5, topn=None):
+    train_docs, vocab_dict, train_word_freq = construct_corpus(train_path, True, threshold=threshold, topn=topn, recursive=True)
+    train_corpus = {'docs': train_docs, 'vocab': vocab_dict, 'word_freq': train_word_freq}
+    dump_json(train_corpus, os.path.join(output, 'train.corpus'))
+    print 'Generated training corpus'
+
+    test_docs, _, _ = construct_corpus(test_path, False, vocab_dict=vocab_dict, recursive=True)
+    test_corpus = {'docs': test_docs}
+    dump_json(test_corpus, os.path.join(output, 'test.corpus'))
+    print 'Generated test corpus'
+
+    return train_corpus, test_corpus
+
 def doc2vec(doc, dim):
     vec = np.zeros(dim)
     for idx, val in doc.items():
@@ -146,58 +144,18 @@ def doc2vec(doc, dim):
 
     return vec
 
-
-############
-# Doc labels
-############
-def get_20news_doc_labels(corpus_path):
-    doc_labels = defaultdict(list)
-    files = get_all_files(corpus_path, True)
-    for filename in files:
-        label, name = filename.split('/')[-2:]
-        doc_labels[name].append(label)
-
-    return doc_labels
-
-def get_8k_doc_labels(doc_names):
-    doc_labels = {}
-    for doc in doc_names:
-        doc_labels[doc] = doc.split('-')[-1].replace('.txt', '')
-
-    return doc_labels
-
-
-#################
-# Vocab
-#################
-
-def get_vocab_dict(word_freq, threshold=5, topn=None):
-    idx = 0
-    vocab_dict = {}
-    if topn:
-        word_freq = dict(sorted(word_freq.items(), key=lambda d:d[1], reverse=True)[:topn])
-    for word, freq in word_freq.iteritems():
-        if freq < threshold:
-            continue
-        vocab_dict[word] = idx
-        idx += 1
-    return vocab_dict
-
-def get_low_freq_words(word_freq, threshold=5):
-    return [word for word, freq in word_freq.iteritems() if freq < threshold]
-
 def idf(docs, dim):
     vec = np.zeros((dim, 1))
     for each_doc in docs:
         for idx in each_doc.keys():
             vec[int(idx)] += 1
+
     return np.log10(1. + len(docs) / vec)
 
 def vocab_weights(vocab_dict, word_freq, max_=100., ratio=.75):
     weights = np.zeros((len(vocab_dict), 1))
     for word, idx in vocab_dict.items():
-        weights[idx] = word_freq[word]
-
+        weights[idx] = word_freq[idx]
     weights = np.clip(weights / max_, 0., 1.)
 
     return np.power(weights, ratio)
@@ -206,10 +164,59 @@ def vocab_weights_tfidf(vocab_dict, word_freq, docs, max_=100., ratio=.75):
     dim = len(vocab_dict)
     tf_vec = np.zeros((dim, 1))
     for word, idx in vocab_dict.items():
-        tf_vec[idx] = 1. + np.log10(word_freq[word]) # log normalization
+        tf_vec[idx] = 1. + np.log10(word_freq[idx]) # log normalization
 
     idf_vec = idf(docs, dim)
     tfidf_vec = tf_vec * idf_vec
 
     tfidf_vec = np.clip(tfidf_vec, 0., 4.)
     return np.power(tfidf_vec, ratio)
+
+# # Init weights with topic modeling results
+# def init_weights(topic_vocab_dist, vocab_dict, epsilon=1e-5):
+#     weights = np.zeros((len(vocab_dict), len(topic_vocab_dist)))
+#     for i in range(len(topic_vocab_dist)):
+#         for k, v in topic_vocab_dist[i]:
+#             weights[vocab_dict[k]][i] = 1. + epsilon
+
+#     return weights
+
+# def init_weights2(topic_vocab, vocab_dict, epsilon=1e-5):
+#     weights = np.zeros((len(vocab_dict), len(topic_vocab)))
+#     for i in range(len(topic_vocab)):
+#         for vocab in topic_vocab[i]:
+#             weights[vocab_dict[vocab]][i] = 1. / len(topic_vocab[i]) + epsilon
+
+#     return weights
+
+def generate_20news_doc_labels(doc_names, output):
+    doc_labels = {}
+    for each in doc_names:
+       label = each.split('_')[0]
+       doc_labels[each] = label
+
+    dump_json(doc_labels, output)
+
+    return doc_labels
+
+def get_8k_doc_bnames(doc_names):
+    doc_labels = {}
+    for doc in doc_names:
+        doc_labels[doc] = doc.split('-')[-1].replace('.txt', '')
+
+    return doc_labels
+
+def get_8k_doc_years(doc_names):
+    doc_labels = {}
+    for doc in doc_names:
+        doc_labels[doc] = doc.split('-')[0]
+
+    return doc_labels
+
+def get_8k_doc_fails(doc_names, bank_fyear):
+    doc_labels = {}
+    for doc in doc_names:
+        fyear = bank_fyear[doc.split('-')[-1].replace('.txt', '')]
+        doc_labels[doc] = 1 if fyear != 'NA' and abs(int(doc.split('-')[0]) - int(fyear)) <= 1 else 0
+
+    return doc_labels
